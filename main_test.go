@@ -202,3 +202,40 @@ func TestRemoveAcceptsEntriesAddDoesNot(t *testing.T) {
 		t.Fatalf("unexpected list %+v", got.Rules)
 	}
 }
+
+func TestGroupedCommands(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := rootCommand()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	run("bypass", "add", "example.org")
+	if got := run("bypass", "list"); got != "example.org\n" {
+		t.Fatalf("bypass list: %q", got)
+	}
+	run("remove", "example.org")
+	if got := run("bypass", "list"); got != "" {
+		t.Fatalf("legacy remove left %q", got)
+	}
+	dir := filepath.Join(home, ".sing-box")
+	if err := writeJSON(filepath.Join(dir, "profiles", "test.json"), object{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(dir, "default.json"), "test"); err != nil {
+		t.Fatal(err)
+	}
+	if got := run("profile", "list"); got != "test (default)\n" {
+		t.Fatalf("profile list: %q", got)
+	}
+	if got := run("list"); got != "test\n" {
+		t.Fatalf("legacy list: %q", got)
+	}
+}

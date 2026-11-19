@@ -51,6 +51,15 @@ func (s *store) loadSelection() error {
 }
 
 func command(use, short string, args cobra.PositionalArgs, handle handler) *cobra.Command {
+	return lockedCommand(use, short, args, func(s store, cmd *cobra.Command, args []string) error {
+		if err := s.loadSelection(); err != nil {
+			return err
+		}
+		return handle(s, cmd, args)
+	})
+}
+
+func lockedCommand(use, short string, args cobra.PositionalArgs, handle handler) *cobra.Command {
 	return &cobra.Command{Use: use, Short: short, Args: args, RunE: func(cmd *cobra.Command, args []string) error {
 		s, err := openStore()
 		if err != nil {
@@ -60,9 +69,6 @@ func command(use, short string, args cobra.PositionalArgs, handle handler) *cobr
 			return err
 		}
 		return withLock(cmd, s.dir, func() error {
-			if err := s.loadSelection(); err != nil {
-				return err
-			}
 			return handle(s, cmd, args)
 		})
 	}}
@@ -104,20 +110,48 @@ func withLock(cmd *cobra.Command, dir string, action func() error) error {
 func rootCommand() *cobra.Command {
 	root := &cobra.Command{Use: "wgsplit", Version: "0.0.1", Short: "Manage sing-box WireGuard profiles and VPN bypass hostnames", SilenceUsage: true, SilenceErrors: true}
 	root.CompletionOptions.DisableDefaultCmd = true
-	importCmd := command("import PROFILE.conf", "Import and validate a WireGuard profile", cobra.ExactArgs(1), store.importProfile)
-	importCmd.Flags().Bool("force", false, "replace an existing profile of the same name")
-	root.AddCommand(
+	makeImport := func() *cobra.Command {
+		cmd := command("import PROFILE.conf", "Import and validate a WireGuard profile", cobra.ExactArgs(1), store.importProfile)
+		cmd.Flags().Bool("force", false, "replace an existing profile of the same name")
+		return cmd
+	}
+	makeDefault := func() *cobra.Command {
+		return command("default [NAME]", "Show or select the default profile for the next start", cobra.MaximumNArgs(1), store.selectDefault)
+	}
+	makeCheck := func() *cobra.Command {
+		return command("check", "Validate the default profile configuration", cobra.NoArgs, store.checkProfile)
+	}
+	makeAdd := func() *cobra.Command {
+		return lockedCommand("add HOSTNAME", "Bypass the VPN for a hostname and its subdomains", cobra.ExactArgs(1), editHosts(add))
+	}
+	makeRemove := func() *cobra.Command {
+		return lockedCommand("remove HOSTNAME", "Remove an explicit bypass entry", cobra.ExactArgs(1), editHosts(remove))
+	}
+	profile := &cobra.Command{Use: "profile", Short: "Manage saved WireGuard profiles"}
+	profile.AddCommand(makeImport(), makeDefault(), makeCheck(), command("list", "List profiles and mark the default", cobra.NoArgs, store.list))
+	bypass := &cobra.Command{Use: "bypass", Short: "Manage hostnames that bypass the VPN for every profile"}
+	bypass.AddCommand(makeAdd(), makeRemove(), lockedCommand("list", "List bypass hostnames", cobra.NoArgs, store.listBypass))
+	start := command("start", "Start the default profile", cobra.NoArgs, func(s store, cmd *cobra.Command, args []string) error {
+		foreground, err := cmd.Flags().GetBool("foreground")
+		if err != nil {
+			return err
+		}
+		if foreground {
+			return s.runProfile(cmd, args)
+		}
+		return s.start(cmd, args)
+	})
+	start.Flags().Bool("foreground", false, "run in the foreground until Ctrl-C")
+	root.AddCommand(profile, bypass, start,
 		readCommand("status", "Show the background job and any running sing-box instances", store.status),
-		importCmd,
-		command("default [NAME]", "Show or select the default profile", cobra.MaximumNArgs(1), store.selectDefault),
+		&cobra.Command{Use: "stop", Short: "Stop your wgsplit background job", Args: cobra.NoArgs, RunE: stop})
+	for _, old := range []*cobra.Command{makeImport(), makeDefault(), makeCheck(), makeAdd(), makeRemove(),
 		command("list", "List saved profile names", cobra.NoArgs, store.list),
 		command("show", "Show saved profiles and shared VPN bypass hostnames", cobra.NoArgs, store.show),
-		command("add HOSTNAME", "Bypass the VPN for a hostname and its subdomains", cobra.ExactArgs(1), editHosts(add)),
-		command("remove HOSTNAME", "Remove an explicit hostname from the shared VPN bypass list", cobra.ExactArgs(1), editHosts(remove)),
-		command("check", "Validate the default sing-box profile", cobra.NoArgs, store.checkProfile),
-		command("start", "Start the default profile as a background job", cobra.NoArgs, store.start),
-		&cobra.Command{Use: "stop", Short: "Stop your wgsplit background job", Args: cobra.NoArgs, RunE: stop},
-		command("run", "Run the default profile in the foreground with sudo (Ctrl-C stops it)", cobra.NoArgs, store.runProfile))
+		command("run", "Run the default profile in the foreground", cobra.NoArgs, store.runProfile)} {
+		old.Hidden = true
+		root.AddCommand(old)
+	}
 	return root
 }
 
@@ -142,9 +176,9 @@ func (s store) existing(name string) (string, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		if name == s.current {
-			return "", fmt.Errorf("the default profile %q no longer exists; choose another with wgsplit default NAME or import it again", name)
+			return "", fmt.Errorf("the default profile %q no longer exists; choose another with wgsplit profile default NAME or import it again", name)
 		}
-		return "", fmt.Errorf("no profile %q (wgsplit list shows saved profiles)", name)
+		return "", fmt.Errorf("no profile %q (wgsplit profile list shows saved profiles)", name)
 	}
 	if err != nil {
 		return "", err
@@ -179,11 +213,28 @@ func (s store) list(cmd *cobra.Command, _ []string) error {
 	}
 	out := cmd.OutOrStdout()
 	if len(names) == 0 {
-		fmt.Fprintln(out, "(no profiles — run wgsplit import PROFILE.conf)")
+		fmt.Fprintln(out, "(no profiles — run wgsplit profile import PROFILE.conf)")
 		return nil
 	}
 	for _, name := range names {
-		fmt.Fprintln(out, name)
+		if cmd.Parent().Name() == "profile" && name == s.current {
+			fmt.Fprintln(out, name, "(default)")
+		} else {
+			fmt.Fprintln(out, name)
+		}
+	}
+	return nil
+}
+
+func (s store) listBypass(cmd *cobra.Command, _ []string) error {
+	list, err := openList(s.domains)
+	if err != nil {
+		return err
+	}
+	for _, rule := range list.Rules {
+		for _, host := range rule.Domains {
+			fmt.Fprintln(cmd.OutOrStdout(), host)
+		}
 	}
 	return nil
 }
@@ -249,9 +300,6 @@ func (s store) selectDefault(cmd *cobra.Command, args []string) error {
 
 func editHosts(edit func(string, string) error) handler {
 	return func(s store, cmd *cobra.Command, args []string) error {
-		if _, err := s.existing(s.current); err != nil {
-			return err
-		}
 		if err := edit(s.domains, args[0]); err != nil {
 			return err
 		}
@@ -379,6 +427,6 @@ func (s store) importProfile(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Fprintln(out, "It is now the default profile.")
 	}
-	fmt.Fprintln(out, "Next: wgsplit add HOSTNAME to send a host outside the VPN, then wgsplit start.")
+	fmt.Fprintln(out, "Next: wgsplit bypass add HOSTNAME to send a host outside the VPN, then wgsplit start.")
 	return nil
 }

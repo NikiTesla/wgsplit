@@ -9,19 +9,19 @@ Install Go 1.26 or newer and sing-box with WireGuard support, then run `go insta
 ## Usage
 
 ```sh
-wgsplit import ~/Downloads/example.conf
-wgsplit add example.org
+wgsplit profile import ~/Downloads/example.conf
+wgsplit bypass add example.org
 wgsplit start
 wgsplit status
-wgsplit remove example.org
+wgsplit bypass remove example.org
 wgsplit stop
 ```
 
-Import accepts a single-peer profile with an IPv4 default route, a numeric endpoint, and DNS server IP addresses. Keys and section names are matched case-insensitively, and a default route written as `0.0.0.0/1, 128.0.0.0/1` is accepted alongside `0.0.0.0/0`. Only the first `DNS` entry is used, because sing-box does not fail over between DNS servers. Importing a name that already exists fails unless you pass `--force`, so a second `wg0.conf` cannot overwrite the first profile and its private key. The first imported profile becomes the default. Use `wgsplit list` to see saved names and `wgsplit default NAME` to change the profile for the next start.
+Import accepts a single-peer profile with an IPv4 default route, a numeric endpoint, and DNS server IP addresses. Keys and section names are matched case-insensitively, and a default route written as `0.0.0.0/1, 128.0.0.0/1` is accepted alongside `0.0.0.0/0`. Only the first `DNS` entry is used, because sing-box does not fail over between DNS servers. Importing a name that already exists fails unless you pass `--force`, so a second `wg0.conf` cannot overwrite the first profile and its private key. The first imported profile becomes the default. Use `wgsplit profile list` to see saved names and `wgsplit profile default NAME` to change the profile for the next start.
 
-Run the CLI as your normal user. Background start and stop use sudo to manage a per-user job in the macOS system launchd domain. You can close the terminal and stop the job from another terminal. The job writes sing-box output to `/var/log/wgsplit.<uid>.log` and does not survive a reboot — run `wgsplit start` again afterwards. To switch a running background job to another profile, stop it, select the default, and start again. For interactive logs, use `wgsplit run` in the foreground; it holds the terminal until you stop it. `wgsplit start` and `wgsplit run` both refuse to start a second instance, because every generated profile claims the same tun addresses.
+Run the CLI as your normal user. Background start and stop use sudo to manage a per-user job in the macOS system launchd domain. You can close the terminal and stop the job from another terminal. The job writes sing-box output to `/var/log/wgsplit.<uid>.log` and does not survive a reboot — run `wgsplit start` again afterwards. To switch a running background job to another profile, stop it, select the default, and start again. For interactive logs, use `wgsplit start --foreground` in the foreground; it holds the terminal until you stop it. `wgsplit start` and `wgsplit start --foreground` both refuse to start a second instance, because every generated profile claims the same tun addresses.
 
-Profiles under `~/.sing-box/profiles/` contain private keys. The shared bypass list includes each named domain and its subdomains, and bypassed names are resolved outside the tunnel as well as routed outside it. New connections pick up edits automatically. Use `wgsplit show` to see profiles and bypass hostnames and `wgsplit check` to validate the default profile.
+Profiles under `~/.sing-box/profiles/` contain private keys. The shared bypass list includes each named domain and its subdomains, and bypassed names are resolved outside the tunnel as well as routed outside it. New connections pick up edits automatically. Use `wgsplit bypass list` to see shared entries, even before importing a profile, and `wgsplit profile check` to validate the default profile.
 
 ## IPv6
 
