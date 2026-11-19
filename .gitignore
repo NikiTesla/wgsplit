@@ -1,0 +1,7 @@
+/wgsplit
+*.conf
+/.sing-box/
+*.plist
+.DS_Store
+config.json
+direct-domains.json
