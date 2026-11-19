@@ -4,18 +4,49 @@ A macOS CLI for using WireGuard as the default sing-box route and sending select
 
 ## Install
 
-Install Go 1.26 or newer and sing-box with WireGuard support, then run `go install .` in this directory. Add your Go binary directory to PATH. The CLI has been tested with sing-box 1.14.4.
+### 1. Install wgsplit once
 
-## Usage
+On macOS with Go 1.26 or newer, run this from the cloned repository:
+
+```sh
+go install .
+wgsplit --help
+```
+
+If your shell cannot find `wgsplit`, add Go’s install directory to your PATH. For zsh, put these lines in `~/.zshrc` and open a new terminal:
+
+```sh
+go_bin="$(go env GOBIN)"
+export PATH="${go_bin:-$(go env GOPATH)/bin}:$PATH"
+```
+
+### 2. Set up sing-box
+
+```sh
+wgsplit setup
+```
+
+Setup uses the `sing-box` executable already on your PATH. If it is missing, setup uses Go to build sing-box v1.14.4 with WireGuard and gVisor support. Run setup as your regular user with Go’s binary directory on PATH (see step 1). The first build downloads dependencies and may take a few minutes. [Upstream build options](https://sing-box.sagernet.org/installation/build-from-source/)
+
+### 3. Import a profile and connect
+
+Replace the example path with your WireGuard configuration. The first imported profile becomes the default. Disconnect any active WireGuard tunnel for that profile before starting wgsplit.
 
 ```sh
 wgsplit profile import ~/Downloads/example.conf
 wgsplit bypass add example.org
 wgsplit start
 wgsplit status
+```
+
+Adding a bypass is optional. In this example, new connections to `example.org` and its subdomains go directly. Other destinations use the tunnel. To remove the exception or disconnect:
+
+```sh
 wgsplit bypass remove example.org
 wgsplit stop
 ```
+
+## Managing profiles and bypass hosts
 
 Import accepts a single-peer profile with an IPv4 default route, a numeric endpoint, and DNS server IP addresses. Keys and section names are matched case-insensitively, and a default route written as `0.0.0.0/1, 128.0.0.0/1` is accepted alongside `0.0.0.0/0`. Only the first `DNS` entry is used, because sing-box does not fail over between DNS servers. Importing a name that already exists fails unless you pass `--force`, so a second `wg0.conf` cannot overwrite the first profile and its private key. The first imported profile becomes the default. Use `wgsplit profile list` to see saved names and `wgsplit profile default NAME` to change the profile for the next start.
 
@@ -30,3 +61,7 @@ sing-box captures the host's IPv6 traffic whenever the tun interface has an IPv6
 ## Security
 
 Generated profiles and the bypass list live under `~/.sing-box/`, which is writable by your user, and `wgsplit start` runs sing-box as root with that config. Any process running as you can therefore change what the root sing-box reads. Treat `~/.sing-box/` as trusted: it offers no protection against local code already running under your account.
+
+## License
+
+wgsplit is distributed under the [MIT license](LICENSE).

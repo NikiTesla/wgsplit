@@ -143,6 +143,7 @@ func rootCommand() *cobra.Command {
 	})
 	start.Flags().Bool("foreground", false, "run in the foreground until Ctrl-C")
 	root.AddCommand(profile, bypass, start,
+		&cobra.Command{Use: "setup", Short: "Install sing-box with Go if needed", Args: cobra.NoArgs, RunE: setup},
 		readCommand("status", "Show the background job and any running sing-box instances", store.status),
 		&cobra.Command{Use: "stop", Short: "Stop your wgsplit background job", Args: cobra.NoArgs, RunE: stop})
 	for _, old := range []*cobra.Command{makeImport(), makeDefault(), makeCheck(), makeAdd(), makeRemove(),
@@ -308,10 +309,31 @@ func editHosts(edit func(string, string) error) handler {
 	}
 }
 
+func setup(cmd *cobra.Command, _ []string) error {
+	binary, err := singboxPath()
+	if errors.Is(err, exec.ErrNotFound) {
+		install := exec.CommandContext(cmd.Context(), "go", "install", "-tags=with_wireguard,with_gvisor", "github.com/sagernet/sing-box/cmd/sing-box@v1.14.4")
+		install.Stdin = cmd.InOrStdin()
+		install.Stdout = cmd.OutOrStdout()
+		install.Stderr = cmd.ErrOrStderr()
+		if err := install.Run(); err != nil {
+			return fmt.Errorf("install sing-box with Go: %w", err)
+		}
+		binary, err = singboxPath()
+		if err != nil {
+			return fmt.Errorf("add the Go binary directory to PATH: %w", err)
+		}
+	} else if err != nil {
+		return err
+	}
+	fmt.Fprintln(cmd.OutOrStdout(), "Using sing-box at", binary)
+	return nil
+}
+
 func singboxPath() (string, error) {
 	binary, err := exec.LookPath("sing-box")
 	if err != nil {
-		return "", fmt.Errorf("sing-box not found in PATH: %w", err)
+		return "", fmt.Errorf("cannot locate sing-box on PATH (run wgsplit setup): %w", err)
 	}
 	return filepath.Abs(binary)
 }
