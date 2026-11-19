@@ -1,3 +1,5 @@
+//go:build darwin
+
 package main
 
 import (
@@ -7,7 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,19 +18,32 @@ import (
 
 const launchctl = "/bin/launchctl"
 
-func jobLabel() string { return fmt.Sprintf("com.github.nikitesla.wgsplit.%d", os.Getuid()) }
+func jobLabel() string  { return fmt.Sprintf("com.github.nikitesla.wgsplit.%d", os.Getuid()) }
+func jobTarget() string { return "system/" + jobLabel() }
+func logPath() string   { return fmt.Sprintf("/var/log/wgsplit.%d.log", os.Getuid()) }
 
-func jobPlist(label, binary, config string) []byte {
+// Writes to a bytes.Buffer cannot fail, so the escape error is not actionable.
+func writeEscaped(b *bytes.Buffer, value string) { _ = xml.EscapeText(b, []byte(value)) }
+
+func jobPlist(label, binary, config, logFile string) []byte {
 	var b bytes.Buffer
 	b.WriteString(`<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>`)
-	xml.EscapeText(&b, []byte(label))
+	writeEscaped(&b, label)
 	b.WriteString("</string><key>ProgramArguments</key><array>")
 	for _, arg := range []string{binary, "run", "-c", config} {
 		b.WriteString("<string>")
-		xml.EscapeText(&b, []byte(arg))
+		writeEscaped(&b, arg)
 		b.WriteString("</string>")
 	}
-	b.WriteString("</array><key>RunAtLoad</key><true/></dict></plist>")
+	b.WriteString("</array>")
+	// Without these keys launchd discards the job's output, leaving a crash
+	// after startup with no trace anywhere.
+	for _, key := range []string{"StandardOutPath", "StandardErrorPath"} {
+		b.WriteString("<key>" + key + "</key><string>")
+		writeEscaped(&b, logFile)
+		b.WriteString("</string>")
+	}
+	b.WriteString("<key>RunAtLoad</key><true/></dict></plist>")
 	return b.Bytes()
 }
 
@@ -43,7 +58,7 @@ umask 077
 
 func privileged(stdin []byte, program string, args ...string) error {
 	if os.Geteuid() != 0 {
-		args = append([]string{program}, args...)
+		args = append([]string{"--", program}, args...)
 		program = "/usr/bin/sudo"
 	}
 	child := exec.Command(program, args...)
@@ -53,74 +68,128 @@ func privileged(stdin []byte, program string, args ...string) error {
 	return child.Run()
 }
 
+type launchdState struct {
+	loaded   bool
+	running  bool
+	exitCode string
+}
+
+// launchctl print is a human-readable debug dump with no stability contract, so
+// read only the two fields wgsplit needs and leave the rest unparsed.
+func parseJobState(out []byte) launchdState {
+	text := string(out)
+	state := launchdState{loaded: true, running: strings.Contains(text, "\n\tstate = running\n")}
+	if _, after, ok := strings.Cut(text, "\n\tlast exit code = "); ok {
+		code, _, _ := strings.Cut(after, "\n")
+		// A job that has never exited reports "(never exited)" here. Only a
+		// numeric code is evidence of an exit, and start tears a job down on
+		// that evidence.
+		if code = strings.TrimSpace(code); isNumeric(code) {
+			state.exitCode = code
+		}
+	}
+	return state
+}
+
+func isNumeric(s string) bool {
+	_, err := strconv.Atoi(s)
+	return err == nil
+}
+
+func jobState() (launchdState, error) {
+	out, err := exec.Command(launchctl, "print", jobTarget()).Output()
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 113 {
+			return launchdState{}, nil
+		}
+		return launchdState{}, fmt.Errorf("inspect background job: %w", err)
+	}
+	return parseJobState(out), nil
+}
+
+func exitText(code string) string {
+	if code == "" {
+		return "unknown"
+	}
+	return code
+}
+
 func (s store) start(cmd *cobra.Command, _ []string) error {
 	path, err := s.existing(s.current)
 	if err != nil {
 		return err
 	}
-	binary, err := exec.LookPath("sing-box")
+	binary, err := singboxPath()
 	if err != nil {
 		return err
 	}
-	binary, err = filepath.Abs(binary)
+	if err := singboxCheck(binary, path, cmd.ErrOrStderr()); err != nil {
+		return fmt.Errorf("%s is not a valid sing-box profile: %w", path, err)
+	}
+	state, err := jobState()
 	if err != nil {
 		return err
 	}
-	check := exec.Command(binary, "check", "-c", path)
-	check.Stderr = cmd.ErrOrStderr()
-	if err := check.Run(); err != nil {
+	if state.loaded {
+		if state.running {
+			return errors.New("the background job is already running; use wgsplit status or wgsplit stop")
+		}
+		// A job without KeepAlive stays loaded after sing-box exits. Clearing it
+		// here keeps start usable instead of refusing on behalf of a job that is
+		// no longer carrying any traffic.
+		fmt.Fprintf(cmd.ErrOrStderr(), "Clearing a stale background job (previous exit code %s).\n", exitText(state.exitCode))
+		if err := privileged(nil, launchctl, "bootout", jobTarget()); err != nil {
+			return fmt.Errorf("clear the stale background job: %w", err)
+		}
+	}
+	running, err := singboxProcesses()
+	if err != nil {
 		return err
 	}
-	target := "system/" + jobLabel()
-	if exec.Command(launchctl, "print", target).Run() == nil {
-		return errors.New("background job already loaded; use wgsplit status or wgsplit stop")
+	if len(running) > 0 {
+		return fmt.Errorf("sing-box is already running (PID %s); stop it before starting the background job", running[0].pid)
 	}
-	if err := privileged(jobPlist(jobLabel(), binary, path), "/bin/sh", "-c", bootstrapScript); err != nil {
+	if err := privileged(jobPlist(jobLabel(), binary, path, logPath()), "/bin/sh", "-c", bootstrapScript); err != nil {
 		return fmt.Errorf("start %s: %w", s.current, err)
 	}
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		time.Sleep(100 * time.Millisecond)
-		state, err := exec.Command(launchctl, "print", target).Output()
+		state, err := jobState()
 		if err != nil {
-			break
+			return err
 		}
-		stateText := string(state)
-		if strings.Contains(stateText, "\n\tstate = running\n") {
-			fmt.Fprintf(cmd.OutOrStdout(), "Started %s in the background.\n", s.current)
+		if !state.loaded {
+			return fmt.Errorf("the background job disappeared during startup; see %s", logPath())
+		}
+		if state.running {
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "Started %s in the background. Logs: %s\n", s.current, logPath())
+			fmt.Fprintln(out, "The job does not survive a reboot; run wgsplit start again afterwards.")
 			return nil
 		}
-		if strings.Contains(stateText, "\n\tlast exit code =") {
-			if err := privileged(nil, launchctl, "bootout", target); err != nil {
-				return fmt.Errorf("job exited; unloading it failed: %w", err)
+		if state.exitCode != "" {
+			if err := privileged(nil, launchctl, "bootout", jobTarget()); err != nil {
+				return fmt.Errorf("sing-box exited (code %s) and clearing the job failed: %w", state.exitCode, err)
 			}
-			return errors.New("sing-box exited during startup; use wgsplit run to see its logs")
+			return fmt.Errorf("sing-box exited during startup (code %s); see %s", state.exitCode, logPath())
 		}
 	}
-	return fmt.Errorf("background job did not reach running state; inspect it with launchctl print %s and unload it with wgsplit stop", target)
+	return fmt.Errorf("the background job did not reach running state; inspect it with launchctl print %s and unload it with wgsplit stop", jobTarget())
 }
 
+// stop touches no file under ~/.sing-box, so it deliberately takes no lock: it
+// must stay usable from a second terminal while start waits on a sudo prompt.
 func stop(cmd *cobra.Command, _ []string) error {
-	home, err := os.UserHomeDir()
+	state, err := jobState()
 	if err != nil {
 		return err
 	}
-	dir := filepath.Join(home, ".sing-box")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
+	if !state.loaded {
+		fmt.Fprintln(cmd.OutOrStdout(), "No wgsplit background job is loaded.")
+		return nil
 	}
-	return withLock(dir, func() error { return stopJob(cmd) })
-}
-func stopJob(cmd *cobra.Command) error {
-	target := "system/" + jobLabel()
-	if err := exec.Command(launchctl, "print", target).Run(); err != nil {
-		var exit *exec.ExitError
-		if errors.As(err, &exit) && exit.ExitCode() == 113 {
-			fmt.Fprintln(cmd.OutOrStdout(), "No wgsplit background job is loaded.")
-			return nil
-		}
-		return fmt.Errorf("inspect background job: %w", err)
-	}
-	if err := privileged(nil, launchctl, "bootout", target); err != nil {
+	if err := privileged(nil, launchctl, "bootout", jobTarget()); err != nil {
 		return fmt.Errorf("stop background job: %w", err)
 	}
 	fmt.Fprintln(cmd.OutOrStdout(), "Stopped the wgsplit background job.")

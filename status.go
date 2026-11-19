@@ -1,9 +1,10 @@
+//go:build darwin
+
 package main
 
 import (
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -11,12 +12,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
+type process struct{ pid, config string }
+
 // ps flattens argv. Only attribute a profile for the unambiguous single-config
 // run form used by wgsplit. Other invocations can merge several config sources.
-func runningConfig(command string) (config string, service bool) {
-	args, ok := strings.CutPrefix(command, "sing-box ")
+func runningConfig(argv string) (configPath string, isRun bool) {
+	args, ok := strings.CutPrefix(argv, "sing-box ")
 	if !ok {
-		_, args, ok = strings.Cut(command, "/sing-box ")
+		_, args, ok = strings.Cut(argv, "/sing-box ")
 	}
 	// macOS may hide argv when the process belongs to another user.
 	if !ok {
@@ -39,18 +42,12 @@ func runningConfig(command string) (config string, service bool) {
 	return "", false
 }
 
-func status(cmd *cobra.Command, _ []string) error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-	profiles := filepath.Join(home, ".sing-box", "profiles")
+func singboxProcesses() ([]process, error) {
 	snapshot, err := exec.Command("/bin/ps", "-axww", "-o", "pid=,stat=,comm=").Output()
 	if err != nil {
-		return fmt.Errorf("list processes: %w", err)
+		return nil, fmt.Errorf("list processes: %w", err)
 	}
-	out := cmd.OutOrStdout()
-	found := false
+	var found []process
 	for _, line := range strings.Split(string(snapshot), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 3 || strings.Contains(fields[1], "Z") || filepath.Base(fields[len(fields)-1]) != "sing-box" {
@@ -63,24 +60,56 @@ func status(cmd *cobra.Command, _ []string) error {
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("inspect sing-box PID %s: %w", pid, err)
+			return nil, fmt.Errorf("inspect sing-box PID %s: %w", pid, err)
 		}
-		path, service := runningConfig(strings.TrimSpace(string(raw)))
-		if !service {
+		path, isRun := runningConfig(strings.TrimSpace(string(raw)))
+		if !isRun {
 			continue
 		}
-		found = true
-		profile := "unavailable"
-		if path != "" {
-			profile = path
-			if filepath.Dir(path) == profiles && filepath.Ext(path) == ".json" {
-				profile = strings.TrimSuffix(filepath.Base(path), ".json") + " (" + path + ")"
-			}
-		}
-		fmt.Fprintf(out, "sing-box running (PID %s) — profile: %s\n", pid, profile)
+		found = append(found, process{pid: pid, config: path})
 	}
-	if !found {
+	return found, nil
+}
+
+func (s store) describe(path string) string {
+	if path == "" {
+		return "unavailable"
+	}
+	if filepath.Dir(path) == s.profiles && filepath.Ext(path) == ".json" {
+		return strings.TrimSuffix(filepath.Base(path), ".json") + " (" + path + ")"
+	}
+	return path
+}
+
+func (s store) status(cmd *cobra.Command, _ []string) error {
+	out := cmd.OutOrStdout()
+	if s.current != "" {
+		fmt.Fprintf(out, "Default profile: %s\n", s.current)
+	}
+	// start and stop manage a launchd job, so status has to report that job and
+	// not just whatever sing-box processes happen to exist.
+	// A launchctl hiccup must not hide the process list below it, which is the
+	// rest of what the user asked for.
+	switch state, err := jobState(); {
+	case err != nil:
+		fmt.Fprintf(out, "Background job: unknown (%v)\n", err)
+	case state.running:
+		fmt.Fprintln(out, "Background job: running")
+	case state.loaded:
+		fmt.Fprintf(out, "Background job: loaded but not running (last exit code %s) — wgsplit start clears it\n", exitText(state.exitCode))
+	default:
+		fmt.Fprintln(out, "Background job: not loaded")
+	}
+	running, err := singboxProcesses()
+	if err != nil {
+		return err
+	}
+	if len(running) == 0 {
 		fmt.Fprintln(out, "sing-box is not running")
+		return nil
+	}
+	for _, p := range running {
+		fmt.Fprintf(out, "sing-box running (PID %s) — profile: %s\n", p.pid, s.describe(p.config))
 	}
 	return nil
 }
