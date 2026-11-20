@@ -239,3 +239,30 @@ func TestGroupedCommands(t *testing.T) {
 		t.Fatalf("legacy list: %q", got)
 	}
 }
+
+func TestValidateSingboxBuild(t *testing.T) {
+	const tags = "\nEnvironment: go1.26.10 darwin/arm64\nTags: with_gvisor,with_wireguard,with_utls\nCGO: enabled\n"
+	for _, tc := range []struct {
+		name    string
+		output  string
+		wantErr bool
+	}{
+		{"current", "sing-box version 1.14.4\n" + tags, false},
+		{"minimum", "sing-box version 1.13.0\n" + tags, false},
+		{"pre-release of minimum", "sing-box version 1.13.0-beta.2\n" + tags, false},
+		{"newer major", "sing-box version 2.0.0\n" + tags, false},
+		{"older minor", "sing-box version 1.12.9\n" + tags, true},
+		{"older major", "sing-box version 0.99.0\n" + tags, true},
+		{"without WireGuard", "sing-box version 1.14.4\n\nTags: with_gvisor,with_utls\n", true},
+		{"tag as substring", "sing-box version 1.14.4\n\nTags: with_wireguard_legacy\n", true},
+		{"no tags line", "sing-box version 1.14.4\n", false},
+		{"unknown version", "sing-box version unknown\n" + tags, false},
+		{"unrecognised output", "something else", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateSingboxBuild(tc.output); (err != nil) != tc.wantErr {
+				t.Fatalf("got %v, want error %v", err, tc.wantErr)
+			}
+		})
+	}
+}

@@ -33,6 +33,7 @@ const (
 	directTag     = "direct"
 	bypassTag     = "bypass"
 	localResolver = "local-dns"
+	outboundField = "outbound"
 )
 
 // Keys wg-quick writes that wgsplit understands, and the section each belongs
@@ -285,7 +286,7 @@ func config(f map[string]string, listPath string) (object, error) {
 		"rules": []object{
 			{"action": "sniff"},
 			{"protocol": "dns", "action": "hijack-dns"},
-			{"rule_set": []string{bypassTag}, "outbound": directTag},
+			{"rule_set": []string{bypassTag}, outboundField: directTag},
 		},
 		"final": tunnelTag,
 	}

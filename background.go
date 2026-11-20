@@ -7,6 +7,8 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"slices"
@@ -14,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	singjson "github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/spf13/cobra"
 )
 
@@ -26,17 +30,104 @@ func logPath() string   { return fmt.Sprintf("/var/log/wgsplit.%d.log", os.Getui
 // Writes to a bytes.Buffer cannot fail, so the escape error is not actionable.
 func writeEscaped(b *bytes.Buffer, value string) { _ = xml.EscapeText(b, []byte(value)) }
 
+var benchmarkingSubnet = netip.MustParsePrefix("198.18.0.0/15")
+
+func validateTunIPv4Prefix(prefix netip.Prefix, interfaceAddrs []net.Addr) error {
+	addr := prefix.Addr()
+	if prefix.Bits() != 30 || addr != prefix.Masked().Addr().Next() {
+		return fmt.Errorf("%s: use the first host of a /30 so the next host is available for DNS", prefix)
+	}
+	if !addr.IsPrivate() && !benchmarkingSubnet.Contains(addr) {
+		return fmt.Errorf("%s: use an RFC 1918 subnet or one in %s", prefix, benchmarkingSubnet)
+	}
+	for _, assigned := range interfaceAddrs {
+		local, err := netip.ParsePrefix(assigned.String())
+		if err != nil {
+			return fmt.Errorf("read interface prefix %s: %w", assigned, err)
+		}
+		if prefix.Overlaps(local) {
+			return fmt.Errorf("%s overlaps local interface address %s", prefix, local)
+		}
+	}
+	return nil
+}
+
+// sing-box uses the address following the first IPv4 TUN address for implicit DNS.
+func tunIPv4Address(path string, interfaceAddrs []net.Addr) (netip.Addr, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("read TUN profile: %w", err)
+	}
+	var profile struct {
+		Inbounds []struct {
+			Type       string                           `json:"type"`
+			Address    badoption.Listable[netip.Prefix] `json:"address"`
+			DNSAddress badoption.Listable[netip.Addr]   `json:"dns_address"`
+		} `json:"inbounds"`
+	}
+	if err := singjson.Unmarshal(data, &profile); err != nil {
+		return netip.Addr{}, fmt.Errorf("decode %s: %w", path, err)
+	}
+
+	for _, inbound := range profile.Inbounds {
+		if inbound.Type != "tun" {
+			continue
+		}
+		var tunAddr netip.Addr
+		for _, prefix := range inbound.Address {
+			addr := prefix.Addr()
+			if !addr.Is4() {
+				continue
+			}
+			if err := validateTunIPv4Prefix(prefix, interfaceAddrs); err != nil {
+				return netip.Addr{}, fmt.Errorf("TUN address in %s: %w", path, err)
+			}
+			if !tunAddr.IsValid() {
+				tunAddr = addr
+			}
+		}
+		if !tunAddr.IsValid() {
+			continue
+		}
+		if len(inbound.DNSAddress) > 0 && !slices.Contains(inbound.DNSAddress, tunAddr.Next()) {
+			return netip.Addr{}, fmt.Errorf("TUN dns_address in %s must include the IPv4 peer %s or be omitted", path, tunAddr.Next())
+		}
+		return tunAddr, nil
+	}
+	return netip.Addr{}, fmt.Errorf("no IPv4 TUN address in %s", path)
+}
+
+func prepareRunArguments(binary, config string) ([]string, error) {
+	assigned, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, fmt.Errorf("list interface addresses before starting the tunnel: %w", err)
+	}
+	addr, err := tunIPv4Address(config, assigned)
+	if err != nil {
+		return nil, fmt.Errorf("prepare tunnel startup: %w", err)
+	}
+	args := runArguments(binary, config, addr)
+	lanConfig, err := prepareLANConfig(binary, config)
+	if err != nil {
+		return nil, fmt.Errorf("prepare LAN bypass: %w", err)
+	}
+	if lanConfig != "" {
+		args = append(args, "-c", lanConfig)
+	}
+	return args, nil
+}
+
 // scutil owns the temporary Dynamic Store key. Its stdin stays open on fd 9
 // across exec and closes when sing-box exits, including on SIGKILL.
-// 172.19.0.2 is the peer of the tun address 172.19.0.1/30 set in main.go.
-func runArguments(binary, config string) []string {
+func runArguments(binary, config string, addr netip.Addr) []string {
 	const script = `set -eu
 key="State:/Network/Service/wgsplit-$$/DNS"
+tun_addr=$3
+dns_addr=$4
 tun_route_ready() {
-    local iface
-    iface=$(/sbin/route -n get -inet 172.19.0.2 2>/dev/null | /usr/bin/awk '$1 == "interface:" {print $2}')
+    iface=$(/sbin/route -n get -inet "$dns_addr" 2>/dev/null | /usr/bin/awk '$1 == "interface:" {print $2}')
     [[ $iface =~ ^utun[0-9]+$ ]] &&
-        /sbin/ifconfig "$iface" | /usr/bin/grep -Eq '^[[:space:]]*inet 172[.]19[.]0[.]1[[:space:]]'
+        /sbin/ifconfig "$iface" | /usr/bin/awk -v addr="$tun_addr" '$1 == "inet" && $2 == addr {found=1} END {exit !found}'
 }
 if tun_route_ready; then
     echo "the wgsplit tunnel address is already in use" >&2
@@ -48,7 +139,7 @@ exec 9> >(/usr/sbin/scutil)
     for ((i=0; i<50; i++)); do
         kill -0 "$$" 2>/dev/null || exit 0
         if tun_route_ready; then
-            if ! printf '%s\n' 'd.init' 'd.add ServerAddresses * 172.19.0.2' 'd.add SupplementalMatchDomains * ""' 'd.add SearchOrder # 1' "add $key temporary" >&9; then
+            if ! printf '%s\n' 'd.init' "d.add ServerAddresses * $dns_addr" 'd.add SupplementalMatchDomains * ""' 'd.add SearchOrder # 1' "add $key temporary" >&9; then
                 break
             fi
             exec 9>&-
@@ -59,19 +150,23 @@ exec 9> >(/usr/sbin/scutil)
         fi
         /bin/sleep 0.1
     done
-    echo "could not register the tunnel DNS resolver" >&2
+    if ((i == 50)); then
+        echo "DNS route to $dns_addr uses ${iface:-no interface}; expected a utun with address $tun_addr" >&2
+    else
+        echo "could not register the tunnel DNS resolver $dns_addr" >&2
+    fi
     kill -TERM "$$" 2>/dev/null
 ) &
-exec "$1" run -c "$2"`
-	return []string{"/bin/bash", "-c", script, "wgsplit", binary, config}
+exec "$1" run -c "$2" "${@:5}"`
+	return []string{"/bin/bash", "-c", script, "wgsplit", binary, config, addr.String(), addr.Next().String()}
 }
 
-func jobPlist(label, binary, config, logFile string) []byte {
+func jobPlist(label string, argv []string, logFile string) []byte {
 	var b bytes.Buffer
 	b.WriteString(`<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>`)
 	writeEscaped(&b, label)
 	b.WriteString("</string><key>ProgramArguments</key><array>")
-	for _, arg := range runArguments(binary, config) {
+	for _, arg := range argv {
 		b.WriteString("<string>")
 		writeEscaped(&b, arg)
 		b.WriteString("</string>")
@@ -181,17 +276,8 @@ func (s store) start(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	if state.loaded {
-		if state.running {
-			return errors.New("the background job is already running; use wgsplit status or wgsplit stop")
-		}
-		// A job without KeepAlive stays loaded after sing-box exits. Clearing it
-		// here keeps start usable instead of refusing on behalf of a job that is
-		// no longer carrying any traffic.
-		fmt.Fprintf(cmd.ErrOrStderr(), "Clearing a stale background job (previous exit code %s).\n", exitText(state.exitCode))
-		if err := privileged(nil, launchctl, "bootout", jobTarget()); err != nil {
-			return fmt.Errorf("clear the stale background job: %w", err)
-		}
+	if state.running {
+		return errors.New("the background job is already running; use wgsplit status or wgsplit stop")
 	}
 	running, err := singboxProcesses()
 	if err != nil {
@@ -200,7 +286,20 @@ func (s store) start(cmd *cobra.Command, _ []string) error {
 	if len(running) > 0 {
 		return fmt.Errorf("sing-box is already running (PID %s); stop it before starting the background job", running[0].pid)
 	}
-	if err := privileged(jobPlist(jobLabel(), binary, path, logPath()), "/bin/sh", "-c", bootstrapScript); err != nil {
+	argv, err := prepareRunArguments(binary, path)
+	if err != nil {
+		return err
+	}
+	if state.loaded {
+		// A job without KeepAlive stays loaded after sing-box exits. Clearing it
+		// here keeps start usable instead of refusing on behalf of a job that is
+		// no longer carrying any traffic.
+		fmt.Fprintf(cmd.ErrOrStderr(), "Clearing a stale background job (previous exit code %s).\n", exitText(state.exitCode))
+		if err := privileged(nil, launchctl, "bootout", jobTarget()); err != nil {
+			return fmt.Errorf("clear the stale background job: %w", err)
+		}
+	}
+	if err := privileged(jobPlist(jobLabel(), argv, logPath()), "/bin/sh", "-c", bootstrapScript); err != nil {
 		return fmt.Errorf("start %s: %w", s.current, err)
 	}
 	for deadline := time.Now().Add(12 * time.Second); time.Now().Before(deadline); {
