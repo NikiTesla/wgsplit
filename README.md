@@ -26,7 +26,7 @@ export PATH="${go_bin:-$(go env GOPATH)/bin}:$PATH"
 wgsplit setup
 ```
 
-Setup uses the `sing-box` executable already on your PATH. If it is missing, setup uses Go to build sing-box v1.14.4 with WireGuard and gVisor support. Run setup as your regular user with Go’s binary directory on PATH (see step 1). The first build downloads dependencies and may take a few minutes. [Upstream build options](https://sing-box.sagernet.org/installation/build-from-source/)
+Setup uses the `sing-box` executable already on your PATH. It must be version 1.13.0 or newer and built with WireGuard support (`with_wireguard`); wgsplit refuses an older or unsupported build. If it is missing, setup uses Go to build sing-box v1.14.4 with WireGuard and gVisor support. Run setup as your regular user with Go’s binary directory on PATH (see step 1). The first build downloads dependencies and may take a few minutes. [Upstream build options](https://sing-box.sagernet.org/installation/build-from-source/)
 
 ### 3. Import a profile and connect
 
@@ -39,7 +39,7 @@ wgsplit start
 wgsplit status
 ```
 
-Adding a bypass is optional. In this example, new connections to `example.org` and its subdomains go directly. Other destinations use the tunnel. To remove the exception or disconnect:
+Adding a bypass is optional. In this example, new connections to `example.org` and its subdomains go directly. Devices on the connected LAN also go directly. Other destinations use the tunnel. To remove the exception or disconnect:
 
 ```sh
 wgsplit bypass remove example.org
@@ -54,11 +54,25 @@ Run the CLI as your normal user. Background start and stop use sudo to manage a 
 
 Both start modes register the TUN DNS address as a temporary macOS resolver. The registration expires when sing-box exits. Restart a running profile after upgrading wgsplit to activate it.
 
+Run `wgsplit profile check` to see the IPv4 TUN address and DNS peer for the selected profile. wgsplit derives the peer from the first IPv4 TUN address. Keep a working profile as it is.
+
+If another VPN captures **only the DNS route**, choose a subnet for your own network:
+
+1. With wgsplit stopped and the other VPN connected, inspect `netstat -rn -f inet` and `ifconfig`. Choose an unused `/30` within `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, or the benchmarking range `198.18.0.0/15`. Check for overlap with LANs, VPN resources, and any proxy's FakeIP pool. If both VPNs claim the same default routes, disconnect one before starting the other.
+2. In the selected profile under `~/.sing-box/profiles/`, edit the IPv4 entry in the **TUN inbound**'s `address` list. Use the first host in the chosen `/30`. For a block ending in `.16/30`, for example, the TUN uses `.17/30` and the DNS peer is `.18`. Leave `dns_address` unset for automatic derivation. Run `wgsplit profile check` to confirm the pair.
+3. Start wgsplit. It checks for overlap with local interface addresses and waits for the DNS peer's route to use the TUN carrying the configured address. After reconnecting another VPN, check `route -n get -inet DNS_PEER` (substitute the printed IP) and `ifconfig INTERFACE` (use the interface from that route). If the interface no longer carries the configured TUN address, stop wgsplit and resolve the conflict before restarting. wgsplit checks route ownership at startup.
+
+**Re-importing resets the TUN address.** Replacing the profile with `wgsplit profile import --force` restores `172.19.0.1/30` and its DNS peer `172.19.0.2`. If you chose a different subnet, reapply your TUN address and confirm the pair with `wgsplit profile check` before starting the tunnel.
+
+At startup, wgsplit reads the IPv4 and IPv6 subnets on active macOS Wi-Fi and Ethernet interfaces (`en0`, `en1`, and so on). New connections to devices on those subnets go directly through the corresponding interface. For example, on `192.168.1.20/24`, a connection to `192.168.1.36` uses the LAN. Private addresses outside the connected subnets still follow your existing routing rules. IPv6 link-local addresses use interface scopes and are excluded from this bypass.
+
+This applies to existing profiles on the next start. wgsplit writes the LAN rules separately in `~/.sing-box/runtime/lan.json`. Your profile's DNS and explicit routing rules take precedence. Restart wgsplit after switching networks to discover the new subnets.
+
 Profiles under `~/.sing-box/profiles/` contain private keys. The shared bypass list includes each named domain and its subdomains, and bypassed names are resolved outside the tunnel as well as routed outside it. New connections pick up edits automatically. Use `wgsplit bypass list` to see shared entries, even before importing a profile, and `wgsplit profile check` to validate the default profile.
 
 ## IPv6
 
-sing-box captures the host's IPv6 traffic whenever the tun interface has an IPv6 address, which wgsplit always assigns. For a profile whose peer has no IPv6 route, that traffic cannot be carried and is dropped, so wgsplit sets the DNS strategy to `ipv4_only` for such profiles. Clients then never receive AAAA records and never attempt the dead path, and no IPv6 traffic escapes the tunnel. The tradeoff is that IPv6-only destinations are unreachable while an IPv4-only profile is up. A profile carrying both `::/0` in `AllowedIPs` and an IPv6 `Address` tunnels IPv6 normally and gets no DNS restriction.
+sing-box captures the host's IPv6 traffic whenever the tun interface has an IPv6 address, which wgsplit always assigns. For a profile whose peer has no IPv6 route, that traffic cannot be carried and is dropped, so wgsplit sets the DNS strategy to `ipv4_only` for such profiles. Clients then never receive AAAA records and never attempt the dead path for those lookups. Explicit bypasses, including directly connected LAN subnets, can still carry IPv6. IPv6-only destinations routed through WireGuard are unreachable while an IPv4-only profile is up. A profile carrying both `::/0` in `AllowedIPs` and an IPv6 `Address` tunnels IPv6 normally and gets no DNS restriction.
 
 ## Security
 

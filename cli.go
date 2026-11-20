@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -335,7 +337,59 @@ func singboxPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cannot locate sing-box on PATH (run wgsplit setup): %w", err)
 	}
-	return filepath.Abs(binary)
+	binary, err = filepath.Abs(binary)
+	if err != nil {
+		return "", err
+	}
+
+	output, err := exec.Command(binary, "version").Output()
+	if err != nil {
+		return "", fmt.Errorf("run %s version: %w", binary, err)
+	}
+	if err := validateSingboxBuild(string(output)); err != nil {
+		return "", fmt.Errorf("%s: %w; replace it, or remove it from PATH and run wgsplit setup", binary, err)
+	}
+	return binary, nil
+}
+
+// LAN routes match on interface_address, which sing-box added in 1.13.0.
+const minSingboxVersion = "1.13.0"
+
+// Output that cannot be parsed passes: sing-box check still reports a build
+// that cannot load the profile, just less clearly.
+func validateSingboxBuild(versionOutput string) error {
+	header, details, _ := strings.Cut(versionOutput, "\n")
+	version, ok := strings.CutPrefix(strings.TrimSpace(header), "sing-box version ")
+	if ok && versionBefore(version, minSingboxVersion) {
+		return fmt.Errorf("sing-box %s is older than the required %s", version, minSingboxVersion)
+	}
+	for _, line := range strings.Split(details, "\n") {
+		tags, ok := strings.CutPrefix(strings.TrimSpace(line), "Tags:")
+		if ok && !slices.Contains(strings.Split(strings.TrimSpace(tags), ","), "with_wireguard") {
+			return errors.New("sing-box was built without the with_wireguard tag")
+		}
+	}
+	return nil
+}
+
+// Pre-release suffixes are ignored, so 1.13.0-beta.1 counts as 1.13.0.
+func versionBefore(version, minimum string) bool {
+	core, _, _ := strings.Cut(version, "-")
+	have, want := strings.Split(core, "."), strings.Split(minimum, ".")
+	if len(have) != len(want) {
+		return false
+	}
+	for i := range want {
+		h, err := strconv.Atoi(have[i])
+		if err != nil {
+			return false
+		}
+		w, _ := strconv.Atoi(want[i])
+		if h != w {
+			return h < w
+		}
+	}
+	return false
 }
 
 func singboxCheck(binary, config string, stderr io.Writer) error {
@@ -356,7 +410,12 @@ func (s store) checkProfile(cmd *cobra.Command, _ []string) error {
 	if err := singboxCheck(binary, path, cmd.ErrOrStderr()); err != nil {
 		return fmt.Errorf("%s is not a valid sing-box profile: %w", path, err)
 	}
+	addr, err := tunIPv4Address(path, nil)
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Profile %q is valid (%s)\n", s.current, path)
+	fmt.Fprintf(cmd.OutOrStdout(), "TUN IPv4: %s/30\nDNS peer: %s\n", addr, addr.Next())
 	return nil
 }
 
@@ -372,7 +431,10 @@ func (s store) runProfile(cmd *cobra.Command, _ []string) error {
 	if err := refuseSecondInstance(); err != nil {
 		return err
 	}
-	argv := runArguments(binary, path)
+	argv, err := prepareRunArguments(binary, path)
+	if err != nil {
+		return err
+	}
 	if os.Geteuid() != 0 {
 		argv = append([]string{"/usr/bin/sudo", "--"}, argv...)
 	}

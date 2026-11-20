@@ -15,7 +15,7 @@ import (
 type process struct{ pid, config string }
 
 // ps flattens argv. Only attribute a profile for the unambiguous single-config
-// run form used by wgsplit. Other invocations can merge several config sources.
+// run form or one with wgsplit's own LAN configuration.
 func runningConfig(argv string) (configPath string, isRun bool) {
 	args, ok := strings.CutPrefix(argv, "sing-box ")
 	if !ok {
@@ -30,8 +30,11 @@ func runningConfig(argv string) (configPath string, isRun bool) {
 	}
 	if rest, ok := strings.CutPrefix(args, "run "); ok {
 		for _, flag := range []string{"-c ", "--config ", "--config="} {
-			if path, ok := strings.CutPrefix(rest, flag); ok && filepath.IsAbs(path) && !strings.Contains(path, " -") {
-				return filepath.Clean(path), true
+			if path, ok := strings.CutPrefix(rest, flag); ok && filepath.IsAbs(path) {
+				profile, extra, hasExtra := strings.Cut(path, " -")
+				if !hasExtra || (filepath.Base(filepath.Dir(profile)) == "profiles" && extra == "c "+lanConfigPath(profile)) {
+					return filepath.Clean(profile), true
+				}
 			}
 		}
 		return "", true
