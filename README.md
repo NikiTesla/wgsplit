@@ -52,6 +52,8 @@ Import accepts a single-peer profile with an IPv4 default route, a numeric endpo
 
 Run the CLI as your normal user. Background start and stop use sudo to manage a per-user job in the macOS system launchd domain. You can close the terminal and stop the job from another terminal. The job writes sing-box output to `/var/log/wgsplit.<uid>.log` and does not survive a reboot — run `wgsplit start` again afterwards. To switch a running background job to another profile, stop it, select the default, and start again. For interactive logs, use `wgsplit start --foreground` in the foreground; it holds the terminal until you stop it. `wgsplit start` and `wgsplit start --foreground` both refuse to start a second instance, because every generated profile claims the same tun addresses.
 
+Both start modes register the TUN DNS address as a temporary macOS resolver. The registration expires when sing-box exits. Restart a running profile after upgrading wgsplit to activate it.
+
 Profiles under `~/.sing-box/profiles/` contain private keys. The shared bypass list includes each named domain and its subdomains, and bypassed names are resolved outside the tunnel as well as routed outside it. New connections pick up edits automatically. Use `wgsplit bypass list` to see shared entries, even before importing a profile, and `wgsplit profile check` to validate the default profile.
 
 ## IPv6

@@ -372,7 +372,7 @@ func (s store) runProfile(cmd *cobra.Command, _ []string) error {
 	if err := refuseSecondInstance(); err != nil {
 		return err
 	}
-	argv := []string{binary, "run", "-c", path}
+	argv := runArguments(binary, path)
 	if os.Geteuid() != 0 {
 		argv = append([]string{"/usr/bin/sudo", "--"}, argv...)
 	}

@@ -276,6 +276,7 @@ func config(f map[string]string, listPath string) (object, error) {
 		dns["strategy"] = "ipv4_only"
 	}
 
+	// runArguments registers 172.19.0.2, the peer in this /30, as the system resolver.
 	tun := object{"type": "tun", "tag": "tun-in", "address": []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"}, "auto_route": true}
 	route := object{
 		"auto_detect_interface":   true,
